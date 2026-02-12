@@ -1,0 +1,20 @@
+# -*- coding: utf-8 -*-
+"""
+ComfyUI-ToolBag
+自定义工具节点包，包含图像合成等节点。
+"""
+
+from .image_composite_center import (
+    NODE_CLASS_MAPPINGS as COMPOSITE_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as COMPOSITE_DISPLAY_MAPPINGS,
+)
+
+NODE_CLASS_MAPPINGS = {
+    **COMPOSITE_MAPPINGS,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    **COMPOSITE_DISPLAY_MAPPINGS,
+}
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
