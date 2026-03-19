@@ -40,7 +40,7 @@ class ResizeAndPadToSquare:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "run"
-    CATEGORY = "image/transform"
+    CATEGORY = "ToolBag/image"
 
     def run(self, image: torch.Tensor, target_size: int, fill_value: float, interpolation: str):
         # image: [B, H, W, C] float32 0..1
