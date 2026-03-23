@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 文件夹图像顺序加载节点
-按顺序逐一读取指定文件夹中的所有图像，配合 JS 自动队列实现全自动批处理。
-状态（当前索引）完全由 Python 端管理，JS 只负责触发续队。
+JS 入队时逐张设置 start_index，Python 直接加载对应图像，无需状态追踪。
 """
 
 import numpy as np
@@ -11,9 +10,6 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
-
-# 按节点 unique_id 保存当前索引：{unique_id: index}
-_node_states: dict = {}
 
 
 def _scan_folder(folder_path: str, recursive: bool = False) -> list:
@@ -36,14 +32,28 @@ def _load_image(path: str) -> torch.Tensor:
     return torch.from_numpy(arr).unsqueeze(0)
 
 
+# ── API 路由：供 JS 提前查询文件夹图像数量 ──
+try:
+    from server import PromptServer
+    from aiohttp import web
+
+    @PromptServer.instance.routes.get("/toolbag/folder_image_count")
+    async def _api_folder_image_count(request):
+        path      = request.query.get("path", "").strip()
+        recursive = request.query.get("recursive", "false").lower() == "true"
+        if not path:
+            return web.json_response({"count": 0, "error": "no path"})
+        images = _scan_folder(path, recursive)
+        return web.json_response({"count": len(images)})
+except Exception:
+    pass
+
+
 class FolderImageLoader:
     """
-    从指定文件夹中按文件名顺序逐一输出图像。
-
-    索引状态由 Python 端通过 unique_id 管理：
-    - 每次执行后自动推进到下一张
-    - 最后一张执行完后自动重置为 0
-    JS 扩展只负责在 has_more=true 时触发下一次 Queue。
+    从指定文件夹中按 start_index 加载单张图像。
+    JS 入队前会依次将 start_index 设为 0,1,2,…，
+    每个 prompt 的输入不同，ComfyUI 自动重新执行，无需额外状态管理。
     """
 
     @classmethod
@@ -57,17 +67,17 @@ class FolderImageLoader:
                 }),
             },
             "optional": {
+                "start_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 99999,
+                    "step": 1,
+                    "tooltip": "加载该序号对应的图像（0=第一张）。有连线时由外部控制，自动批量入队失效。",
+                }),
                 "recursive": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "开启后递归扫描所有子文件夹中的图像",
                 }),
-                "reset": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "设为 True 可强制从第一张重新开始",
-                }),
-            },
-            "hidden": {
-                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -77,10 +87,11 @@ class FolderImageLoader:
     CATEGORY = "ToolBag/loader"
 
     @classmethod
-    def IS_CHANGED(cls, folder_path, recursive=False, reset=False, unique_id=None):
+    def IS_CHANGED(cls, folder_path, start_index=0, recursive=False):
+        # start_index 每次不同，输入已变化，此处 nan 仅作保底
         return float("nan")
 
-    def run(self, folder_path, recursive=False, reset=False, unique_id=None):
+    def run(self, folder_path, start_index=0, recursive=False):
         folder_path = folder_path.strip()
         if not folder_path:
             raise ValueError("请输入文件夹路径")
@@ -93,28 +104,17 @@ class FolderImageLoader:
             )
 
         total = len(images)
+        idx   = max(0, min(start_index, total - 1))
 
-        # reset=True 或首次运行时从 0 开始
-        if reset or unique_id not in _node_states:
-            _node_states[unique_id] = 0
-
-        idx = _node_states[unique_id]
-        # 防止越界（文件夹内容变化时）
-        idx = max(0, min(idx, total - 1))
-
-        img_path = images[idx]
-        image = _load_image(img_path)
-        filename = Path(img_path).name
+        image    = _load_image(images[idx])
+        filename = Path(images[idx]).name
         has_more = (idx + 1) < total
-
-        # 推进状态：有更多则指向下一张，否则重置为 0
-        _node_states[unique_id] = (idx + 1) if has_more else 0
 
         return {
             "ui": {
                 "has_more": [has_more],
-                "index": [idx],
-                "total": [total],
+                "index":    [idx],
+                "total":    [total],
                 "filename": [filename],
             },
             "result": (image, filename, idx, total, has_more),
