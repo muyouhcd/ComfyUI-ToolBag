@@ -26,3 +26,31 @@ ComfyUI 自定义工具节点包。
 ## 安装
 
 将本目录 `ComfyUI-ToolBag` 放入 ComfyUI 的 `custom_nodes` 下即可，无需额外依赖。重启 ComfyUI 后即可在节点菜单中找到上述节点。
+
+## Windows 一键启动
+
+完成 ComfyUI 环境安装后，双击以下脚本即可启动 ComfyUI 和插件管理器：
+
+```text
+custom_nodes\ComfyUI-ToolBag\scripts\start_comfyui_windows.bat
+```
+
+脚本会自动定位 ComfyUI 根目录，并在端口已被占用时打开当前运行中的实例。可通过 `COMFYUI_ROOT`、`COMFYUI_HOST` 和 `COMFYUI_PORT` 环境变量覆盖默认设置。
+
+## Linux 一键部署
+
+ToolBag 自带 Linux 部署脚本，可自动检查 Python 和虚拟环境、识别 NVIDIA/AMD/Intel/CPU、安装 ComfyUI 依赖与插件管理器，并在安装失败时重试。
+
+在 ComfyUI 根目录运行：
+
+```bash
+bash custom_nodes/ComfyUI-ToolBag/scripts/deploy_linux.sh --background
+```
+
+默认监听 `127.0.0.1:8188`。需要局域网访问时，可显式设置监听地址：
+
+```bash
+COMFYUI_HOST=0.0.0.0 bash custom_nodes/ComfyUI-ToolBag/scripts/deploy_linux.sh --background
+```
+
+使用 `--setup-only` 可只配置环境而不启动 ComfyUI。脚本也支持通过 `COMFYUI_ROOT`、`COMFYUI_VENV_DIR`、`COMFYUI_PYTHON` 和 `COMFYUI_TORCH_INDEX_URL` 覆盖自动检测结果。
