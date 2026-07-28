@@ -1,0 +1,315 @@
+import asyncio
+import os
+import re
+import time
+import uuid
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
+
+import aiohttp
+import folder_paths
+
+
+MAX_WORKERS = 8
+MIN_PART_SIZE = 16 * 1024 * 1024
+ALLOWED_EXTENSIONS = {
+    ".bin",
+    ".ckpt",
+    ".gguf",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".safetensors",
+    ".sft",
+}
+CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+
+_downloads = {}
+_tasks = {}
+ACTIVE_STATUSES = {"running", "paused"}
+
+
+class DownloadError(RuntimeError):
+    pass
+
+
+def validate_modelscope_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"modelscope.cn", "www.modelscope.cn"}:
+        raise ValueError("仅支持 ModelScope HTTPS 下载地址")
+    if parsed.port not in {None, 443}:
+        raise ValueError("ModelScope 下载地址端口不合法")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 6 or parts[0] != "models" or parts[3] != "resolve":
+        raise ValueError("不是有效的 ModelScope 模型文件地址")
+    return url
+
+
+def resolve_target_path(directory, name):
+    directory = folder_paths.map_legacy(directory)
+    if directory not in folder_paths.folder_names_and_paths:
+        raise ValueError(f"未知模型目录：{directory}")
+
+    normalized_name = name.replace("\\", "/")
+    relative = PurePosixPath(normalized_name)
+    if relative.is_absolute() or ".." in relative.parts or not relative.name:
+        raise ValueError("模型文件名不合法")
+    if relative.suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"不支持的模型文件类型：{relative.suffix}")
+
+    root = Path(folder_paths.get_folder_paths(directory)[0]).resolve()
+    target = root.joinpath(*relative.parts).resolve()
+    if not folder_paths.is_within_directory(str(root), str(target)):
+        raise ValueError("模型保存路径超出目标目录")
+    return directory, target
+
+
+def split_ranges(total_size, workers):
+    part_size = (total_size + workers - 1) // workers
+    ranges = []
+    start = 0
+    while start < total_size:
+        end = min(start + part_size - 1, total_size - 1)
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
+def public_status(task_id):
+    status = _downloads.get(task_id)
+    if status is None:
+        return None
+
+    result = {key: value for key, value in status.items() if not key.startswith("_")}
+    if status["status"] in ACTIVE_STATUSES:
+        elapsed = status["_active_elapsed"]
+        if status["_active_started"] is not None:
+            elapsed += time.monotonic() - status["_active_started"]
+        elapsed = max(elapsed, 0.001)
+        result["speed"] = int(status["downloaded"] / elapsed)
+    return result
+
+
+def _prune_downloads():
+    completed = [
+        (task_id, status)
+        for task_id, status in _downloads.items()
+        if status["status"] not in ACTIVE_STATUSES
+    ]
+    completed.sort(key=lambda item: item[1]["created_at"])
+    for task_id, _status in completed[:-50]:
+        _downloads.pop(task_id, None)
+        _tasks.pop(task_id, None)
+
+
+def _validate_download_response(response):
+    content_type = response.headers.get("Content-Type", "").lower()
+    if content_type.startswith("text/html") or "json" in content_type:
+        raise DownloadError("ModelScope 返回了登录页或错误信息，请检查登录授权")
+
+
+async def _probe_file(session, url):
+    headers = {"Range": "bytes=0-0", "Accept-Encoding": "identity"}
+    async with session.get(url, headers=headers) as response:
+        if response.status in {401, 403, 451}:
+            raise DownloadError("模型需要登录或授权，请先在 ModelScope 完成登录和模型授权")
+        if response.status not in {200, 206}:
+            raise DownloadError(f"ModelScope 返回 HTTP {response.status}")
+        _validate_download_response(response)
+
+        content_range = response.headers.get("Content-Range")
+        if response.status == 206 and content_range:
+            match = CONTENT_RANGE_RE.match(content_range)
+            if not match:
+                raise DownloadError("ModelScope 返回了无效的分段信息")
+            total_size = int(match.group(3))
+            return total_size, True
+
+        content_length = response.headers.get("Content-Length")
+        if not content_length:
+            raise DownloadError("无法获取模型文件大小")
+        return int(content_length), False
+
+
+async def _download_range(session, url, temp_path, start, end, status):
+    position = start
+    retries = 3
+    with temp_path.open("r+b", buffering=0) as output:
+        output.seek(start)
+        while position <= end:
+            await status["_pause_event"].wait()
+            headers = {
+                "Range": f"bytes={position}-{end}",
+                "Accept-Encoding": "identity",
+            }
+            try:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 206:
+                        raise DownloadError(f"分段下载失败：HTTP {response.status}")
+                    _validate_download_response(response)
+
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        await status["_pause_event"].wait()
+                        await asyncio.to_thread(output.write, chunk)
+                        position += len(chunk)
+                        status["downloaded"] += len(chunk)
+                if position <= end:
+                    raise aiohttp.ClientPayloadError("分段连接提前结束")
+            except aiohttp.ClientError:
+                if retries == 0:
+                    raise
+                retries -= 1
+                await asyncio.sleep(1)
+
+    expected_end = end + 1
+    if position != expected_end:
+        raise DownloadError(f"分段大小不匹配：预期结束于 {expected_end}，实际 {position}")
+
+
+async def _download_single(session, url, temp_path, status):
+    async with session.get(url, headers={"Accept-Encoding": "identity"}) as response:
+        if response.status != 200:
+            raise DownloadError(f"下载失败：HTTP {response.status}")
+        _validate_download_response(response)
+
+        with temp_path.open("wb", buffering=0) as output:
+            async for chunk in response.content.iter_chunked(1024 * 1024):
+                await status["_pause_event"].wait()
+                await asyncio.to_thread(output.write, chunk)
+                status["downloaded"] += len(chunk)
+
+
+async def _run_download(task_id, url, directory, target, token):
+    status = _downloads[task_id]
+    temp_path = target.with_name(f".{target.name}.toolbag.part")
+    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=None)
+    headers = {"User-Agent": "ComfyUI-ToolBag/ModelScopeDownloader"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            total_size, supports_ranges = await _probe_file(session, url)
+            status["total"] = total_size
+            workers = min(MAX_WORKERS, max(1, (total_size + MIN_PART_SIZE - 1) // MIN_PART_SIZE))
+
+            if supports_ranges and workers > 1:
+                with temp_path.open("wb") as output:
+                    output.truncate(total_size)
+                await asyncio.gather(
+                    *[
+                        _download_range(session, url, temp_path, start, end, status)
+                        for start, end in split_ranges(total_size, workers)
+                    ]
+                )
+            else:
+                await _download_single(session, url, temp_path, status)
+
+        if temp_path.stat().st_size != total_size:
+            raise DownloadError("下载完成后的文件大小不匹配")
+
+        os.replace(temp_path, target)
+        folder_paths.filename_list_cache.pop(directory, None)
+        status.update({
+            "status": "complete",
+            "downloaded": total_size,
+            "path": str(target),
+        })
+    except asyncio.CancelledError:
+        temp_path.unlink(missing_ok=True)
+        status.update({
+            "status": "canceled",
+            "downloaded": 0,
+            "total": 0,
+            "speed": 0,
+            "error": None,
+        })
+        raise
+    except Exception as error:
+        temp_path.unlink(missing_ok=True)
+        status.update({
+            "status": "error",
+            "error": str(error),
+        })
+    finally:
+        _tasks.pop(task_id, None)
+
+
+def start_download(url, directory, name, token=None):
+    validate_modelscope_url(url)
+    directory, target = resolve_target_path(directory, name)
+
+    if target.is_file():
+        return {
+            "status": "complete",
+            "existing": True,
+            "path": str(target),
+            "name": name,
+        }
+
+    for task_id, status in _downloads.items():
+        if status["status"] in ACTIVE_STATUSES and status["path"] == str(target):
+            return {"task_id": task_id, **public_status(task_id)}
+
+    _prune_downloads()
+    task_id = uuid.uuid4().hex
+    _downloads[task_id] = {
+        "task_id": task_id,
+        "status": "running",
+        "name": name,
+        "path": str(target),
+        "downloaded": 0,
+        "total": 0,
+        "speed": 0,
+        "error": None,
+        "created_at": time.time(),
+        "_active_started": time.monotonic(),
+        "_active_elapsed": 0.0,
+        "_pause_event": asyncio.Event(),
+    }
+    _downloads[task_id]["_pause_event"].set()
+    _tasks[task_id] = asyncio.create_task(
+        _run_download(task_id, url, directory, target, token)
+    )
+    return public_status(task_id)
+
+
+def toggle_pause(task_id):
+    status = _downloads.get(task_id)
+    if status is None:
+        raise ValueError("下载任务不存在")
+
+    if status["status"] == "running":
+        status["_active_elapsed"] += time.monotonic() - status["_active_started"]
+        status["_active_started"] = None
+        status["_pause_event"].clear()
+        status["status"] = "paused"
+    elif status["status"] == "paused":
+        status["_active_started"] = time.monotonic()
+        status["_pause_event"].set()
+        status["status"] = "running"
+    else:
+        raise ValueError("当前下载任务不能暂停或继续")
+    return public_status(task_id)
+
+
+async def cancel_download(task_id):
+    status = _downloads.get(task_id)
+    if status is None:
+        raise ValueError("下载任务不存在")
+    if status["status"] not in ACTIVE_STATUSES:
+        raise ValueError("当前下载任务不能取消")
+
+    status["_pause_event"].set()
+    task = _tasks.get(task_id)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    return public_status(task_id)
