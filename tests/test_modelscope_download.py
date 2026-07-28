@@ -63,10 +63,12 @@ class ModelScopeDownloadTest(unittest.TestCase):
             "downloaded": 1024,
             "total": 2048,
             "speed": 0,
+            "stalled": False,
             "error": None,
             "created_at": time.time(),
-            "_active_started": time.monotonic(),
-            "_active_elapsed": 0.0,
+            "_last_progress_at": time.monotonic(),
+            "_speed_window_started": time.monotonic(),
+            "_speed_window_bytes": 0,
             "_pause_event": pause_event,
         }
         try:
@@ -77,6 +79,35 @@ class ModelScopeDownloadTest(unittest.TestCase):
             resumed = modelscope_download.toggle_pause(task_id)
             self.assertEqual(resumed["status"], "running")
             self.assertTrue(pause_event.is_set())
+        finally:
+            modelscope_download._downloads.pop(task_id, None)
+
+    def test_stalled_download_reports_zero_speed(self):
+        task_id = "stalled-test"
+        pause_event = asyncio.Event()
+        pause_event.set()
+        modelscope_download._downloads[task_id] = {
+            "task_id": task_id,
+            "status": "running",
+            "name": "model.safetensors",
+            "path": "model.safetensors",
+            "downloaded": 1024,
+            "total": 2048,
+            "speed": 512,
+            "stalled": False,
+            "error": None,
+            "created_at": time.time(),
+            "_last_progress_at": (
+                time.monotonic() - modelscope_download.SPEED_STALE_AFTER - 1
+            ),
+            "_speed_window_started": time.monotonic(),
+            "_speed_window_bytes": 0,
+            "_pause_event": pause_event,
+        }
+        try:
+            status = modelscope_download.public_status(task_id)
+            self.assertTrue(status["stalled"])
+            self.assertEqual(status["speed"], 0)
         finally:
             modelscope_download._downloads.pop(task_id, None)
 
@@ -130,10 +161,12 @@ class ModelScopeDownloadTest(unittest.TestCase):
                     "downloaded": 0,
                     "total": 0,
                     "speed": 0,
+                    "stalled": False,
                     "error": None,
                     "created_at": time.time(),
-                    "_active_started": time.monotonic(),
-                    "_active_elapsed": 0.0,
+                    "_last_progress_at": time.monotonic(),
+                    "_speed_window_started": time.monotonic(),
+                    "_speed_window_bytes": 0,
                     "_pause_event": pause_event,
                 }
                 await modelscope_download._run_download(

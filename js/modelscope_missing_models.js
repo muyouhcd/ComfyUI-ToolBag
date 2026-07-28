@@ -23,9 +23,15 @@ function renderDownloadState(button, state) {
         return;
     }
     if (state.status === "running") {
-        const percent = state.total ? Math.floor(state.downloaded / state.total * 100) : 0;
-        button.textContent = `${percent}% · ${formatBytes(state.speed)}/s`;
-        button.title = "点击暂停下载";
+        const percent = state.total
+            ? (state.downloaded / state.total * 100).toFixed(1)
+            : "0.0";
+        button.textContent = state.stalled
+            ? `${percent}% · 正在重连…`
+            : `${percent}% · ${formatBytes(state.downloaded)} · ${formatBytes(state.speed)}/s`;
+        button.title = state.stalled
+            ? "连接超过 5 秒没有收到数据，下载器将自动重连"
+            : `已下载 ${formatBytes(state.downloaded)} / ${formatBytes(state.total)}；点击暂停`;
         button.disabled = false;
         return;
     }
@@ -204,6 +210,7 @@ function createModelScopeButton(modelName) {
         flexShrink: "0",
         fontSize: "0.75rem",
         minWidth: "6rem",
+        whiteSpace: "nowrap",
     });
 
     renderDownloadState(button, downloadStateByName.get(modelName));

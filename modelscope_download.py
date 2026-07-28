@@ -12,6 +12,10 @@ import folder_paths
 
 MAX_WORKERS = 8
 MIN_PART_SIZE = 16 * 1024 * 1024
+SOCKET_READ_TIMEOUT = 30
+SPEED_UPDATE_INTERVAL = 0.5
+SPEED_STALE_AFTER = 5
+MAX_RANGE_RETRIES = 8
 ALLOWED_EXTENSIONS = {
     ".bin",
     ".ckpt",
@@ -30,6 +34,10 @@ ACTIVE_STATUSES = {"running", "paused"}
 
 
 class DownloadError(RuntimeError):
+    pass
+
+
+class RetryableDownloadError(DownloadError):
     pass
 
 
@@ -82,12 +90,13 @@ def public_status(task_id):
         return None
 
     result = {key: value for key, value in status.items() if not key.startswith("_")}
-    if status["status"] in ACTIVE_STATUSES:
-        elapsed = status["_active_elapsed"]
-        if status["_active_started"] is not None:
-            elapsed += time.monotonic() - status["_active_started"]
-        elapsed = max(elapsed, 0.001)
-        result["speed"] = int(status["downloaded"] / elapsed)
+    result["stalled"] = False
+    if status["status"] == "paused":
+        result["speed"] = 0
+    elif status["status"] == "running":
+        if time.monotonic() - status["_last_progress_at"] >= SPEED_STALE_AFTER:
+            result["speed"] = 0
+            result["stalled"] = True
     return result
 
 
@@ -107,6 +116,19 @@ def _validate_download_response(response):
     content_type = response.headers.get("Content-Type", "").lower()
     if content_type.startswith("text/html") or "json" in content_type:
         raise DownloadError("ModelScope 返回了登录页或错误信息，请检查登录授权")
+
+
+def _record_progress(status, size):
+    now = time.monotonic()
+    status["downloaded"] += size
+    status["_speed_window_bytes"] += size
+    status["_last_progress_at"] = now
+
+    elapsed = now - status["_speed_window_started"]
+    if elapsed >= SPEED_UPDATE_INTERVAL:
+        status["speed"] = int(status["_speed_window_bytes"] / elapsed)
+        status["_speed_window_bytes"] = 0
+        status["_speed_window_started"] = now
 
 
 async def _probe_file(session, url):
@@ -134,11 +156,12 @@ async def _probe_file(session, url):
 
 async def _download_range(session, url, temp_path, start, end, status):
     position = start
-    retries = 3
+    failures = 0
     with temp_path.open("r+b", buffering=0) as output:
         output.seek(start)
         while position <= end:
             await status["_pause_event"].wait()
+            request_start = position
             headers = {
                 "Range": f"bytes={position}-{end}",
                 "Accept-Encoding": "identity",
@@ -146,6 +169,10 @@ async def _download_range(session, url, temp_path, start, end, status):
             try:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 206:
+                        if response.status in {408, 425, 429, 500, 502, 503, 504}:
+                            raise RetryableDownloadError(
+                                f"分段下载暂时失败：HTTP {response.status}"
+                            )
                         raise DownloadError(f"分段下载失败：HTTP {response.status}")
                     _validate_download_response(response)
 
@@ -153,14 +180,15 @@ async def _download_range(session, url, temp_path, start, end, status):
                         await status["_pause_event"].wait()
                         await asyncio.to_thread(output.write, chunk)
                         position += len(chunk)
-                        status["downloaded"] += len(chunk)
+                        _record_progress(status, len(chunk))
                 if position <= end:
                     raise aiohttp.ClientPayloadError("分段连接提前结束")
-            except aiohttp.ClientError:
-                if retries == 0:
-                    raise
-                retries -= 1
-                await asyncio.sleep(1)
+            except (aiohttp.ClientError, RetryableDownloadError) as error:
+                failures = 0 if position > request_start else failures + 1
+                if failures > MAX_RANGE_RETRIES:
+                    raise DownloadError(f"分段多次重连失败：{error}") from error
+                await status["_pause_event"].wait()
+                await asyncio.sleep(min(2 ** max(failures - 1, 0), 8))
 
     expected_end = end + 1
     if position != expected_end:
@@ -177,13 +205,17 @@ async def _download_single(session, url, temp_path, status):
             async for chunk in response.content.iter_chunked(1024 * 1024):
                 await status["_pause_event"].wait()
                 await asyncio.to_thread(output.write, chunk)
-                status["downloaded"] += len(chunk)
+                _record_progress(status, len(chunk))
 
 
 async def _run_download(task_id, url, directory, target, token):
     status = _downloads[task_id]
     temp_path = target.with_name(f".{target.name}.toolbag.part")
-    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=None)
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=30,
+        sock_read=SOCKET_READ_TIMEOUT,
+    )
     headers = {"User-Agent": "ComfyUI-ToolBag/ModelScopeDownloader"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -226,6 +258,7 @@ async def _run_download(task_id, url, directory, target, token):
             "downloaded": 0,
             "total": 0,
             "speed": 0,
+            "stalled": False,
             "error": None,
         })
         raise
@@ -265,10 +298,12 @@ def start_download(url, directory, name, token=None):
         "downloaded": 0,
         "total": 0,
         "speed": 0,
+        "stalled": False,
         "error": None,
         "created_at": time.time(),
-        "_active_started": time.monotonic(),
-        "_active_elapsed": 0.0,
+        "_last_progress_at": time.monotonic(),
+        "_speed_window_started": time.monotonic(),
+        "_speed_window_bytes": 0,
         "_pause_event": asyncio.Event(),
     }
     _downloads[task_id]["_pause_event"].set()
@@ -284,12 +319,14 @@ def toggle_pause(task_id):
         raise ValueError("下载任务不存在")
 
     if status["status"] == "running":
-        status["_active_elapsed"] += time.monotonic() - status["_active_started"]
-        status["_active_started"] = None
         status["_pause_event"].clear()
         status["status"] = "paused"
+        status["speed"] = 0
     elif status["status"] == "paused":
-        status["_active_started"] = time.monotonic()
+        now = time.monotonic()
+        status["_last_progress_at"] = now
+        status["_speed_window_started"] = now
+        status["_speed_window_bytes"] = 0
         status["_pause_event"].set()
         status["status"] = "running"
     else:
