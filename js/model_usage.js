@@ -315,6 +315,14 @@ const metricsStyles = `
     .toolbag-metrics-temperature-name { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
     .toolbag-metrics-temperature-value { font-size: 13px; font-weight: 650; }
     .toolbag-metrics-temperature-limit { grid-column: 1 / -1; color: var(--descrip-text, #aaa); font-size: 10px; }
+    .toolbag-metrics-service-card { padding: 11px; border: 1px solid rgb(224 92 92 / 35%); border-radius: 9px; background: rgb(224 92 92 / 7%); }
+    .toolbag-metrics-service-description { margin-bottom: 9px; color: var(--descrip-text, #aaa); font-size: 11px; line-height: 1.5; }
+    .toolbag-metrics-restart { width: 100%; border: 1px solid #b84b4b; border-radius: 7px; padding: 8px 10px; cursor: pointer; color: #ffd3d3; background: rgb(184 75 75 / 18%); font-weight: 650; }
+    .toolbag-metrics-restart:hover:not(:disabled) { color: white; background: #a43f3f; }
+    .toolbag-metrics-restart:disabled { cursor: wait; opacity: .55; }
+    .toolbag-metrics-service-message { margin-top: 8px; color: var(--descrip-text, #aaa); font-size: 10px; text-align: center; }
+    .toolbag-metrics-service-message.success { color: #65d895; }
+    .toolbag-metrics-service-message.error { color: #ff8f8f; }
     .toolbag-metrics-empty, .toolbag-metrics-error { padding: 24px 8px; color: var(--descrip-text, #aaa); text-align: center; }
     .toolbag-metrics-error { color: #ff8f8f; }
 `;
@@ -384,6 +392,9 @@ const createMetricsPanel = (root, signal) => {
     const state = {
         metrics: null,
         loading: false,
+        restarting: false,
+        restartMessage: "",
+        restartMessageType: "",
         error: "",
     };
 
@@ -424,7 +435,9 @@ const createMetricsPanel = (root, signal) => {
     const render = () => {
         refresh.disabled = state.loading;
         status.replaceChildren();
-        if (state.metrics) {
+        if (state.restarting) {
+            status.append(createElement("span", "", "正在重启 ComfyUI，请稍候…"));
+        } else if (state.metrics) {
             status.append(
                 createElement("span", "toolbag-metrics-live", "每 2 秒自动刷新"),
                 createElement(
@@ -597,10 +610,102 @@ const createMetricsPanel = (root, signal) => {
             );
             disksSection.append(card);
         }
+
+        const serviceSection = addSection("服务控制");
+        const serviceCard = createElement("div", "toolbag-metrics-service-card");
+        serviceCard.append(createElement(
+            "div",
+            "toolbag-metrics-service-description",
+            "重启会中断当前正在执行的工作流和加载任务，systemd 将自动重新启动 ComfyUI。",
+        ));
+        const restart = createElement(
+            "button",
+            "toolbag-metrics-restart",
+            state.restarting ? "正在重启 ComfyUI…" : "重启 ComfyUI",
+        );
+        restart.type = "button";
+        restart.disabled = state.restarting
+            || metrics.service_control?.restart_supported === false;
+        restart.setAttribute("aria-label", "重启 ComfyUI 服务");
+        restart.addEventListener("click", async () => {
+            const confirmed = window.confirm(
+                "确定要重启 ComfyUI 吗？\n\n当前正在执行的工作流、模型加载和队列任务都会中断。",
+            );
+            if (!confirmed) return;
+
+            state.restarting = true;
+            state.restartMessage = "重启请求已发送，正在等待服务恢复…";
+            state.restartMessageType = "";
+            render();
+            try {
+                const response = await api.fetchApi("/toolbag/system/restart", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ confirm: "RESTART_COMFYUI" }),
+                    signal,
+                });
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error || `重启失败 (${response.status})`);
+                }
+
+                const deadline = Date.now() + 90000;
+                const requestedAt = Date.now();
+                let observedOffline = false;
+                while (!signal.aborted && Date.now() < deadline) {
+                    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+                    try {
+                        const metricsResponse = await api.fetchApi(
+                            "/toolbag/system/metrics",
+                            { signal },
+                        );
+                        if (!metricsResponse.ok) throw new Error("服务尚未恢复");
+                        const nextMetrics = await metricsResponse.json();
+                        const restartedController = (
+                            nextMetrics.service_control?.restart_scheduled === false
+                            && Date.now() - requestedAt > 3000
+                        );
+                        if (observedOffline || restartedController) {
+                            state.metrics = nextMetrics;
+                            state.restarting = false;
+                            state.restartMessage = "ComfyUI 已重启并恢复连接";
+                            state.restartMessageType = "success";
+                            render();
+                            return;
+                        }
+                    } catch (error) {
+                        if (error.name === "AbortError") return;
+                        observedOffline = true;
+                    }
+                }
+                throw new Error("等待 ComfyUI 重启超时，请检查服务器服务状态");
+            } catch (error) {
+                if (error.name === "AbortError") return;
+                state.restarting = false;
+                state.restartMessage = error.message || "重启 ComfyUI 失败";
+                state.restartMessageType = "error";
+                render();
+            }
+        }, { signal });
+        serviceCard.append(restart);
+        if (metrics.service_control?.restart_supported === false) {
+            serviceCard.append(createElement(
+                "div",
+                "toolbag-metrics-service-message error",
+                "当前运行方式不支持从面板重启",
+            ));
+        } else if (state.restartMessage) {
+            serviceCard.append(createElement(
+                "div",
+                `toolbag-metrics-service-message ${state.restartMessageType}`.trim(),
+                state.restartMessage,
+            ));
+        }
+        serviceSection.append(serviceCard);
     };
 
     const load = async () => {
-        if (state.loading || signal.aborted) return;
+        if (state.loading || state.restarting || signal.aborted) return;
         state.loading = true;
         state.error = "";
         render();
