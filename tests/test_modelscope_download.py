@@ -47,6 +47,36 @@ class ModelScopeDownloadTest(unittest.TestCase):
             finally:
                 del folder_paths.folder_names_and_paths[category]
 
+    def test_inspect_models_reports_installed_and_missing(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp_dir:
+            category = "toolbag_inspect_models"
+            Path(temp_dir, "installed.safetensors").write_bytes(b"model")
+            folder_paths.folder_names_and_paths[category] = (
+                [temp_dir],
+                {".safetensors"},
+            )
+            try:
+                models = modelscope_download.inspect_models(
+                    [
+                        {
+                            "name": "installed.safetensors",
+                            "directory": category,
+                        },
+                        {
+                            "name": "missing.safetensors",
+                            "directory": category,
+                        },
+                    ]
+                )
+            finally:
+                del folder_paths.folder_names_and_paths[category]
+
+        self.assertTrue(models[0]["installed"])
+        self.assertFalse(models[1]["installed"])
+        self.assertTrue(models[1]["downloadable"])
+
     def test_split_ranges_covers_file_without_overlap(self):
         ranges = modelscope_download.split_ranges(10, 3)
         self.assertEqual(ranges, [(0, 3), (4, 7), (8, 9)])
@@ -81,6 +111,57 @@ class ModelScopeDownloadTest(unittest.TestCase):
             self.assertTrue(pause_event.is_set())
         finally:
             modelscope_download._downloads.pop(task_id, None)
+
+    def test_new_download_queues_behind_active_file(self):
+        asyncio.run(self._run_queued_download_test())
+
+    async def _run_queued_download_test(self):
+        from tempfile import TemporaryDirectory
+
+        category = "toolbag_queue_models"
+        busy_id = "busy-download"
+        modelscope_download._downloads[busy_id] = {
+            "task_id": busy_id,
+            "status": "running",
+            "name": "busy.safetensors",
+            "path": "busy.safetensors",
+            "downloaded": 0,
+            "total": 1,
+            "speed": 0,
+            "stalled": False,
+            "error": None,
+            "created_at": time.time() - 1,
+            "_started": True,
+        }
+        try:
+            with TemporaryDirectory() as temp_dir:
+                folder_paths.folder_names_and_paths[category] = (
+                    [temp_dir],
+                    {".safetensors"},
+                )
+                queued = modelscope_download.start_download(
+                    "https://www.modelscope.cn/models/Comfy-Org/test/"
+                    "resolve/master/queued.safetensors",
+                    category,
+                    "queued.safetensors",
+                )
+                task_id = queued["task_id"]
+                self.assertEqual(queued["status"], "queued")
+                self.assertEqual(queued["queue_position"], 1)
+
+                paused = modelscope_download.toggle_pause(task_id)
+                self.assertEqual(paused["status"], "paused")
+                resumed = modelscope_download.toggle_pause(task_id)
+                self.assertEqual(resumed["status"], "queued")
+
+                canceled = await modelscope_download.cancel_download(task_id)
+                self.assertEqual(canceled["status"], "canceled")
+        finally:
+            folder_paths.folder_names_and_paths.pop(category, None)
+            modelscope_download._downloads.pop(busy_id, None)
+            for task_id in list(modelscope_download._downloads):
+                if task_id != "parallel-test":
+                    modelscope_download._downloads.pop(task_id, None)
 
     def test_stalled_download_reports_zero_speed(self):
         task_id = "stalled-test"
