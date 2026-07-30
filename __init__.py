@@ -33,6 +33,7 @@ from .image_alpha_fill import (
     NODE_DISPLAY_NAME_MAPPINGS as ALPHA_FILL_DISPLAY_MAPPINGS,
 )
 from . import modelscope_routes
+from . import model_usage_routes
 
 NODE_CLASS_MAPPINGS = {
     **COMPOSITE_MAPPINGS,
