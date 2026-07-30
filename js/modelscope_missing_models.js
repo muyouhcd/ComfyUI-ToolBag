@@ -189,7 +189,38 @@ function getMissingModelName(title) {
     if (!name) return null;
 
     const label = title.textContent?.trim() ?? "";
+    if (label === name) return name;
     return label.startsWith(name) && /\(\d+\)$/.test(label) ? name : null;
+}
+
+function getMissingModelHeader(title) {
+    if (title.matches("p[title]")) {
+        const header = title.parentElement?.parentElement;
+        const row = header?.parentElement;
+        const isLegacyMissingModelRow = row?.querySelector(
+            '[data-testid^="missing-model-"], input[id^="url-input-"]',
+        );
+        if (header && isLegacyMissingModelRow) return header;
+    }
+
+    const currentHeader = title.parentElement?.parentElement?.parentElement;
+    const currentRow = currentHeader?.parentElement;
+    if (
+        currentHeader
+        && currentRow?.querySelector('[data-testid^="missing-model-"]')
+    ) {
+        return currentHeader;
+    }
+
+    let current = title.parentElement;
+    for (let depth = 0; current && depth < 6; depth += 1) {
+        const hasDirectMissingModelControl = Array.from(current.children).some(
+            (child) => child.matches?.('[data-testid^="missing-model-"]'),
+        );
+        if (hasDirectMissingModelControl) return current;
+        current = current.parentElement;
+    }
+    return null;
 }
 
 function createModelScopeButton(modelName) {
@@ -251,18 +282,14 @@ function createCancelButton(modelName) {
 }
 
 function addModelScopeButtons() {
-    for (const title of document.querySelectorAll("p[title]")) {
+    for (const title of document.querySelectorAll(
+        "p[title], button[title], span[title]",
+    )) {
         const modelName = getMissingModelName(title);
         if (!modelName) continue;
 
-        const header = title.parentElement?.parentElement;
+        const header = getMissingModelHeader(title);
         if (!header || header.querySelector(`[${BUTTON_ATTRIBUTE}]`)) continue;
-
-        const row = header.parentElement;
-        const isMissingModelRow = row?.querySelector(
-            '[data-testid^="missing-model-"], input[id^="url-input-"]',
-        );
-        if (!isMissingModelRow) continue;
 
         header.append(
             createModelScopeButton(modelName),
