@@ -5,6 +5,7 @@ from .modelscope_download import (
     cancel_download,
     inspect_models,
     list_downloads,
+    pause_all_downloads,
     public_status,
     start_download,
     toggle_pause,
@@ -43,6 +44,11 @@ async def start_modelscope_download(request):
 @PromptServer.instance.routes.get("/toolbag/modelscope/downloads")
 async def get_modelscope_downloads(request):
     return web.json_response(list_downloads())
+
+
+@PromptServer.instance.routes.post("/toolbag/modelscope/downloads/pause")
+async def pause_all_modelscope_downloads(request):
+    return web.json_response(pause_all_downloads())
 
 
 @PromptServer.instance.routes.get("/toolbag/modelscope/download/{task_id}")

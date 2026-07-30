@@ -112,6 +112,59 @@ class ModelScopeDownloadTest(unittest.TestCase):
         finally:
             modelscope_download._downloads.pop(task_id, None)
 
+    def test_pause_all_downloads_pauses_running_and_queued(self):
+        running_event = asyncio.Event()
+        running_event.set()
+        modelscope_download._downloads.update(
+            {
+                "pause-all-running": {
+                    "task_id": "pause-all-running",
+                    "status": "running",
+                    "name": "running.safetensors",
+                    "path": "running.safetensors",
+                    "downloaded": 1024,
+                    "total": 2048,
+                    "speed": 512,
+                    "stalled": False,
+                    "error": None,
+                    "created_at": time.time(),
+                    "_started": True,
+                    "_last_progress_at": time.monotonic(),
+                    "_speed_window_started": time.monotonic(),
+                    "_speed_window_bytes": 0,
+                    "_pause_event": running_event,
+                },
+                "pause-all-queued": {
+                    "task_id": "pause-all-queued",
+                    "status": "queued",
+                    "name": "queued.safetensors",
+                    "path": "queued.safetensors",
+                    "downloaded": 0,
+                    "total": 0,
+                    "speed": 0,
+                    "stalled": False,
+                    "error": None,
+                    "created_at": time.time() + 1,
+                    "_started": False,
+                },
+            }
+        )
+        try:
+            result = modelscope_download.pause_all_downloads()
+            self.assertEqual(result["paused_count"], 2)
+            self.assertFalse(running_event.is_set())
+            self.assertEqual(
+                modelscope_download._downloads["pause-all-running"]["status"],
+                "paused",
+            )
+            self.assertEqual(
+                modelscope_download._downloads["pause-all-queued"]["status"],
+                "paused",
+            )
+        finally:
+            modelscope_download._downloads.pop("pause-all-running", None)
+            modelscope_download._downloads.pop("pause-all-queued", None)
+
     def test_new_download_queues_behind_active_file(self):
         asyncio.run(self._run_queued_download_test())
 

@@ -474,6 +474,26 @@ def toggle_pause(task_id):
     return public_status(task_id)
 
 
+def pause_all_downloads():
+    paused_count = 0
+    for status in _downloads.values():
+        if status["status"] == "queued":
+            status["status"] = "paused"
+            status["speed"] = 0
+            paused_count += 1
+        elif status["status"] == "running":
+            status["_started"] = status.get("_started", True)
+            status["_pause_event"].clear()
+            status["status"] = "paused"
+            status["speed"] = 0
+            paused_count += 1
+
+    return {
+        "paused_count": paused_count,
+        "downloads": list_downloads(),
+    }
+
+
 async def cancel_download(task_id):
     status = _downloads.get(task_id)
     if status is None:
