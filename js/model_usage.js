@@ -279,3 +279,370 @@ app.registerExtension({
         });
     },
 });
+
+const metricsStyles = `
+    .toolbag-system-metrics { height: 100%; min-width: 0; overflow: auto; padding: 14px; box-sizing: border-box; color: var(--fg-color, #ddd); background: var(--comfy-menu-bg, #202020); }
+    .toolbag-metrics-header { position: sticky; z-index: 2; top: -14px; margin: -14px -14px 12px; padding: 15px 14px 11px; border-bottom: 1px solid var(--border-color, #444); background: var(--comfy-menu-bg, #202020); }
+    .toolbag-metrics-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .toolbag-metrics-title { margin: 0; font-size: 16px; font-weight: 650; }
+    .toolbag-metrics-refresh { border: 0; border-radius: 6px; padding: 6px 9px; cursor: pointer; color: inherit; background: var(--comfy-input-bg, #333); }
+    .toolbag-metrics-refresh:hover { filter: brightness(1.15); }
+    .toolbag-metrics-refresh:disabled { cursor: wait; opacity: .55; }
+    .toolbag-metrics-status { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: var(--descrip-text, #aaa); font-size: 11px; }
+    .toolbag-metrics-live { display: inline-flex; align-items: center; gap: 5px; }
+    .toolbag-metrics-live::before { width: 7px; height: 7px; border-radius: 50%; background: #42c878; box-shadow: 0 0 0 3px rgb(66 200 120 / 14%); content: ""; }
+    .toolbag-metrics-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
+    .toolbag-metrics-summary-card, .toolbag-metrics-card { min-width: 0; border: 1px solid var(--border-color, #444); border-radius: 9px; background: var(--comfy-input-bg, #292929); }
+    .toolbag-metrics-summary-card { padding: 10px; }
+    .toolbag-metrics-summary-value { display: block; overflow: hidden; font-size: 18px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+    .toolbag-metrics-summary-label { display: block; margin-top: 2px; color: var(--descrip-text, #aaa); font-size: 11px; }
+    .toolbag-metrics-section { margin: 0 0 14px; }
+    .toolbag-metrics-section-title { margin: 0 0 7px; color: var(--descrip-text, #aaa); font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; }
+    .toolbag-metrics-card { margin-bottom: 7px; padding: 10px; }
+    .toolbag-metrics-card-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+    .toolbag-metrics-card-title { min-width: 0; overflow-wrap: anywhere; font-size: 13px; font-weight: 650; }
+    .toolbag-metrics-card-detail { flex: none; color: var(--descrip-text, #aaa); font-size: 11px; }
+    .toolbag-metrics-row { margin-top: 9px; }
+    .toolbag-metrics-row:first-child { margin-top: 0; }
+    .toolbag-metrics-row-label { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; font-size: 11px; }
+    .toolbag-metrics-row-value { color: var(--descrip-text, #aaa); text-align: right; }
+    .toolbag-metrics-bar { height: 6px; overflow: hidden; border-radius: 99px; background: rgb(127 127 127 / 22%); }
+    .toolbag-metrics-bar-fill { height: 100%; border-radius: inherit; background: #43a6dd; transition: width .35s ease; }
+    .toolbag-metrics-bar-fill.warning { background: #e9a23b; }
+    .toolbag-metrics-bar-fill.danger { background: #e05c5c; }
+    .toolbag-metrics-temperature-list { display: grid; gap: 6px; }
+    .toolbag-metrics-temperature { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; padding: 8px 9px; border-radius: 7px; background: rgb(127 127 127 / 10%); }
+    .toolbag-metrics-temperature-name { min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+    .toolbag-metrics-temperature-value { font-size: 13px; font-weight: 650; }
+    .toolbag-metrics-temperature-limit { grid-column: 1 / -1; color: var(--descrip-text, #aaa); font-size: 10px; }
+    .toolbag-metrics-empty, .toolbag-metrics-error { padding: 24px 8px; color: var(--descrip-text, #aaa); text-align: center; }
+    .toolbag-metrics-error { color: #ff8f8f; }
+`;
+
+const formatDuration = (seconds) => {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return `${days ? `${days} 天 ` : ""}${hours} 小时 ${minutes} 分`;
+};
+
+const formatPercent = (value) => (
+    Number.isFinite(value) ? `${value.toFixed(1)}%` : "不可用"
+);
+
+const severityClass = (percent) => {
+    if (percent >= 90) return "danger";
+    if (percent >= 75) return "warning";
+    return "";
+};
+
+const temperatureSeverity = (sensor) => {
+    if (sensor.critical && sensor.current >= sensor.critical) return "danger";
+    if (sensor.high && sensor.current >= sensor.high) return "warning";
+    if (sensor.current >= 90) return "danger";
+    if (sensor.current >= 80) return "warning";
+    return "";
+};
+
+const temperatureDeviceName = (name) => {
+    const known = {
+        acpitz: "主板",
+        amdgpu: "AMD GPU",
+        k10temp: "CPU",
+        nvme: "NVMe",
+        mt7925_phy0: "Wi-Fi",
+    };
+    if (known[name]) return known[name];
+    if (name.startsWith("r8169")) return "有线网卡";
+    return name;
+};
+
+const createMetricBar = (label, percent, detail) => {
+    const row = createElement("div", "toolbag-metrics-row");
+    const labelRow = createElement("div", "toolbag-metrics-row-label");
+    labelRow.append(
+        createElement("span", "", label),
+        createElement("span", "toolbag-metrics-row-value", detail),
+    );
+    const bar = createElement("div", "toolbag-metrics-bar");
+    bar.setAttribute("role", "progressbar");
+    bar.setAttribute("aria-label", label);
+    bar.setAttribute("aria-valuemin", "0");
+    bar.setAttribute("aria-valuemax", "100");
+    bar.setAttribute("aria-valuenow", String(Number.isFinite(percent) ? percent : 0));
+    const fill = createElement(
+        "div",
+        `toolbag-metrics-bar-fill ${severityClass(percent)}`.trim(),
+    );
+    fill.style.width = `${Math.min(Math.max(percent || 0, 0), 100)}%`;
+    bar.append(fill);
+    row.append(labelRow, bar);
+    return row;
+};
+
+const createMetricsPanel = (root, signal) => {
+    const state = {
+        metrics: null,
+        loading: false,
+        error: "",
+    };
+
+    root.replaceChildren();
+    const style = createElement("style");
+    style.textContent = metricsStyles;
+    const panel = createElement("section", "toolbag-system-metrics");
+    panel.setAttribute("aria-label", "服务器系统资源监控");
+    const header = createElement("header", "toolbag-metrics-header");
+    const titleRow = createElement("div", "toolbag-metrics-title-row");
+    titleRow.append(createElement("h2", "toolbag-metrics-title", "服务器资源监控"));
+    const refresh = createElement("button", "toolbag-metrics-refresh", "立即刷新");
+    refresh.type = "button";
+    refresh.setAttribute("aria-label", "立即刷新服务器资源");
+    titleRow.append(refresh);
+    const status = createElement("div", "toolbag-metrics-status");
+    header.append(titleRow, status);
+    const content = createElement("div", "toolbag-metrics-content");
+    panel.append(header, content);
+    root.append(style, panel);
+
+    const addSummaryCard = (container, value, label) => {
+        const card = createElement("div", "toolbag-metrics-summary-card");
+        card.append(
+            createElement("span", "toolbag-metrics-summary-value", value),
+            createElement("span", "toolbag-metrics-summary-label", label),
+        );
+        container.append(card);
+    };
+
+    const addSection = (title) => {
+        const section = createElement("section", "toolbag-metrics-section");
+        section.append(createElement("h3", "toolbag-metrics-section-title", title));
+        content.append(section);
+        return section;
+    };
+
+    const render = () => {
+        refresh.disabled = state.loading;
+        status.replaceChildren();
+        if (state.metrics) {
+            status.append(
+                createElement("span", "toolbag-metrics-live", "每 2 秒自动刷新"),
+                createElement(
+                    "span",
+                    "",
+                    new Date(state.metrics.timestamp * 1000).toLocaleTimeString(),
+                ),
+            );
+        } else {
+            status.append(createElement("span", "", state.loading ? "正在连接服务器…" : ""));
+        }
+
+        content.replaceChildren();
+        if (!state.metrics && state.loading) {
+            content.append(createElement("div", "toolbag-metrics-empty", "正在读取硬件指标…"));
+            return;
+        }
+        if (!state.metrics && state.error) {
+            content.append(createElement("div", "toolbag-metrics-error", state.error));
+            return;
+        }
+        const metrics = state.metrics;
+        if (!metrics) return;
+
+        const primaryGpu = metrics.gpus[0];
+        const rootDisk = metrics.disks.find((disk) => disk.mountpoint === "/") || metrics.disks[0];
+        const summary = createElement("div", "toolbag-metrics-summary");
+        addSummaryCard(summary, formatPercent(metrics.cpu.percent), "CPU 占用");
+        addSummaryCard(summary, formatPercent(metrics.memory.percent), "内存占用");
+        addSummaryCard(
+            summary,
+            primaryGpu ? formatPercent(primaryGpu.memory.percent) : "未检测到",
+            "显存占用",
+        );
+        addSummaryCard(
+            summary,
+            rootDisk ? formatBytes(rootDisk.free) : "未检测到",
+            "系统盘剩余",
+        );
+        content.append(summary);
+
+        const systemSection = addSection("系统");
+        const systemCard = createElement("div", "toolbag-metrics-card");
+        const systemTitle = createElement("div", "toolbag-metrics-card-title-row");
+        systemTitle.append(
+            createElement("span", "toolbag-metrics-card-title", metrics.hostname),
+            createElement(
+                "span",
+                "toolbag-metrics-card-detail",
+                `运行 ${formatDuration(metrics.uptime_seconds)}`,
+            ),
+        );
+        systemCard.append(
+            systemTitle,
+            createMetricBar(
+                `CPU · ${metrics.cpu.physical_cores || "?"} 核 / ${metrics.cpu.logical_cores || "?"} 线程`,
+                metrics.cpu.percent,
+                formatPercent(metrics.cpu.percent),
+            ),
+            createMetricBar(
+                "内存",
+                metrics.memory.percent,
+                `${formatBytes(metrics.memory.used)} / ${formatBytes(metrics.memory.total)}`,
+            ),
+            createMetricBar(
+                "Swap",
+                metrics.swap.percent,
+                `${formatBytes(metrics.swap.used)} / ${formatBytes(metrics.swap.total)}`,
+            ),
+        );
+        systemSection.append(systemCard);
+
+        const gpuSection = addSection("GPU 与显存");
+        if (!metrics.gpus.length) {
+            gpuSection.append(createElement("div", "toolbag-metrics-card", "未检测到可读取的 GPU 指标"));
+        }
+        for (const gpu of metrics.gpus) {
+            const card = createElement("div", "toolbag-metrics-card");
+            const cardTitle = createElement("div", "toolbag-metrics-card-title-row");
+            const detail = [
+                gpu.driver,
+                Number.isFinite(gpu.temperature) ? `${gpu.temperature.toFixed(1)} °C` : "",
+            ].filter(Boolean).join(" · ");
+            cardTitle.append(
+                createElement("span", "toolbag-metrics-card-title", gpu.name),
+                createElement("span", "toolbag-metrics-card-detail", detail),
+            );
+            card.append(cardTitle);
+            if (Number.isFinite(gpu.utilization_percent)) {
+                card.append(createMetricBar(
+                    "GPU 占用",
+                    gpu.utilization_percent,
+                    formatPercent(gpu.utilization_percent),
+                ));
+            }
+            card.append(createMetricBar(
+                "专用显存 VRAM",
+                gpu.memory.percent,
+                `${formatBytes(gpu.memory.used)} / ${formatBytes(gpu.memory.total)}`,
+            ));
+            if (gpu.gtt.total) {
+                card.append(createMetricBar(
+                    "共享显存 GTT",
+                    gpu.gtt.percent,
+                    `${formatBytes(gpu.gtt.used)} / ${formatBytes(gpu.gtt.total)}`,
+                ));
+            }
+            gpuSection.append(card);
+        }
+
+        const temperaturesSection = addSection("设备温度");
+        if (!metrics.temperatures.length) {
+            temperaturesSection.append(createElement("div", "toolbag-metrics-card", "系统未提供温度传感器数据"));
+        } else {
+            const list = createElement("div", "toolbag-metrics-temperature-list");
+            for (const sensor of [...metrics.temperatures].sort((a, b) => b.current - a.current)) {
+                const item = createElement("div", "toolbag-metrics-temperature");
+                const severity = temperatureSeverity(sensor);
+                const value = createElement(
+                    "span",
+                    `toolbag-metrics-temperature-value ${severity}`.trim(),
+                    `${sensor.current.toFixed(1)} °C`,
+                );
+                if (severity === "warning") value.style.color = "#e9a23b";
+                if (severity === "danger") value.style.color = "#e05c5c";
+                item.append(
+                    createElement(
+                        "span",
+                        "toolbag-metrics-temperature-name",
+                        `${temperatureDeviceName(sensor.device)} · ${sensor.label}`,
+                    ),
+                    value,
+                );
+                const limits = [];
+                if (sensor.high) limits.push(`高温 ${sensor.high.toFixed(1)} °C`);
+                if (sensor.critical && sensor.critical !== sensor.high) {
+                    limits.push(`临界 ${sensor.critical.toFixed(1)} °C`);
+                }
+                if (limits.length) {
+                    item.append(createElement(
+                        "span",
+                        "toolbag-metrics-temperature-limit",
+                        limits.join(" · "),
+                    ));
+                }
+                list.append(item);
+            }
+            temperaturesSection.append(list);
+        }
+
+        const disksSection = addSection("硬盘空间");
+        for (const disk of metrics.disks) {
+            const card = createElement("div", "toolbag-metrics-card");
+            const cardTitle = createElement("div", "toolbag-metrics-card-title-row");
+            cardTitle.append(
+                createElement("span", "toolbag-metrics-card-title", disk.mountpoint),
+                createElement(
+                    "span",
+                    "toolbag-metrics-card-detail",
+                    `${disk.device} · 剩余 ${formatBytes(disk.free)}`,
+                ),
+            );
+            card.append(
+                cardTitle,
+                createMetricBar(
+                    "已使用",
+                    disk.percent,
+                    `${formatBytes(disk.used)} / ${formatBytes(disk.total)}`,
+                ),
+            );
+            disksSection.append(card);
+        }
+    };
+
+    const load = async () => {
+        if (state.loading || signal.aborted) return;
+        state.loading = true;
+        state.error = "";
+        render();
+        try {
+            const response = await api.fetchApi("/toolbag/system/metrics", { signal });
+            if (!response.ok) throw new Error(`读取系统指标失败 (${response.status})`);
+            state.metrics = await response.json();
+        } catch (error) {
+            if (error.name === "AbortError") return;
+            state.error = error.message || "读取系统指标失败";
+        } finally {
+            state.loading = false;
+            if (!signal.aborted) render();
+        }
+    };
+
+    refresh.addEventListener("click", load, { signal });
+    const timer = window.setInterval(load, 2000);
+    signal.addEventListener("abort", () => window.clearInterval(timer), { once: true });
+    load();
+};
+
+let metricsPanelController;
+
+app.registerExtension({
+    name: "ComfyUI.ToolBag.SystemMetrics",
+    setup() {
+        app.extensionManager.registerSidebarTab({
+            id: "toolbag-system-metrics",
+            icon: "pi pi-server",
+            title: "服务器资源监控",
+            tooltip: "实时查看 CPU、内存、显存、温度与硬盘余量",
+            type: "custom",
+            render(element) {
+                metricsPanelController?.abort();
+                metricsPanelController = new AbortController();
+                createMetricsPanel(element, metricsPanelController.signal);
+            },
+            destroy() {
+                metricsPanelController?.abort();
+                metricsPanelController = undefined;
+            },
+        });
+    },
+});
