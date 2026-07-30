@@ -11,6 +11,7 @@ import folder_paths
 
 
 MAX_WORKERS = 8
+MAX_ACTIVE_DOWNLOADS = 1
 MIN_PART_SIZE = 16 * 1024 * 1024
 SOCKET_READ_TIMEOUT = 30
 SPEED_UPDATE_INTERVAL = 0.5
@@ -30,7 +31,7 @@ CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 
 _downloads = {}
 _tasks = {}
-ACTIVE_STATUSES = {"running", "paused"}
+ACTIVE_STATUSES = {"queued", "running", "paused"}
 
 
 class DownloadError(RuntimeError):
@@ -91,13 +92,139 @@ def public_status(task_id):
 
     result = {key: value for key, value in status.items() if not key.startswith("_")}
     result["stalled"] = False
-    if status["status"] == "paused":
+    if status["status"] == "queued":
+        queued = sorted(
+            (
+                item
+                for item in _downloads.values()
+                if item["status"] == "queued"
+            ),
+            key=lambda item: item["created_at"],
+        )
+        result["queue_position"] = next(
+            (
+                index
+                for index, item in enumerate(queued, start=1)
+                if item["task_id"] == task_id
+            ),
+            None,
+        )
+        result["speed"] = 0
+    elif status["status"] == "paused":
         result["speed"] = 0
     elif status["status"] == "running":
         if time.monotonic() - status["_last_progress_at"] >= SPEED_STALE_AFTER:
             result["speed"] = 0
             result["stalled"] = True
     return result
+
+
+def list_downloads():
+    return [
+        public_status(task_id)
+        for task_id, _status in sorted(
+            _downloads.items(),
+            key=lambda item: item[1]["created_at"],
+        )
+    ]
+
+
+def _model_is_installed(directory, name):
+    directory = folder_paths.map_legacy(directory)
+    if directory not in folder_paths.folder_names_and_paths:
+        return False
+
+    normalized_name = name.replace("\\", "/")
+    relative = PurePosixPath(normalized_name)
+    if relative.is_absolute() or ".." in relative.parts or not relative.name:
+        return False
+
+    for root_path in folder_paths.get_folder_paths(directory):
+        root = Path(root_path).resolve()
+        target = root.joinpath(*relative.parts).resolve()
+        if (
+            folder_paths.is_within_directory(str(root), str(target))
+            and target.is_file()
+        ):
+            return True
+    return False
+
+
+def inspect_models(models):
+    result = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        name = model.get("name")
+        directory = model.get("directory")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(directory, str) or not directory.strip():
+            result.append(
+                {
+                    **model,
+                    "installed": False,
+                    "downloadable": False,
+                    "reason": "工作流没有提供模型目录",
+                }
+            )
+            continue
+        mapped_directory = folder_paths.map_legacy(directory)
+        known_directory = mapped_directory in folder_paths.folder_names_and_paths
+        result.append(
+            {
+                **model,
+                "directory": mapped_directory,
+                "installed": (
+                    _model_is_installed(mapped_directory, name)
+                    if known_directory
+                    else False
+                ),
+                "downloadable": known_directory,
+                "reason": None if known_directory else "未知模型目录",
+            }
+        )
+    return result
+
+
+def _has_active_slot():
+    active = sum(
+        1
+        for status in _downloads.values()
+        if status.get("_started")
+        and status["status"] in {"running", "paused"}
+    )
+    return active < MAX_ACTIVE_DOWNLOADS
+
+
+def _schedule_downloads():
+    while _has_active_slot():
+        queued = min(
+            (
+                status
+                for status in _downloads.values()
+                if status["status"] == "queued"
+            ),
+            key=lambda status: status["created_at"],
+            default=None,
+        )
+        if queued is None:
+            return
+        task_id = queued["task_id"]
+        queued["status"] = "running"
+        queued["_started"] = True
+        queued["_last_progress_at"] = time.monotonic()
+        queued["_speed_window_started"] = time.monotonic()
+        queued["_pause_event"].set()
+        _tasks[task_id] = asyncio.create_task(
+            _run_download(
+                task_id,
+                queued["_url"],
+                queued["_directory"],
+                queued["_target"],
+                queued["_token"],
+            )
+        )
 
 
 def _prune_downloads():
@@ -269,7 +396,9 @@ async def _run_download(task_id, url, directory, target, token):
             "error": str(error),
         })
     finally:
+        status["_started"] = False
         _tasks.pop(task_id, None)
+        _schedule_downloads()
 
 
 def start_download(url, directory, name, token=None):
@@ -292,7 +421,7 @@ def start_download(url, directory, name, token=None):
     task_id = uuid.uuid4().hex
     _downloads[task_id] = {
         "task_id": task_id,
-        "status": "running",
+        "status": "queued",
         "name": name,
         "path": str(target),
         "downloaded": 0,
@@ -305,11 +434,14 @@ def start_download(url, directory, name, token=None):
         "_speed_window_started": time.monotonic(),
         "_speed_window_bytes": 0,
         "_pause_event": asyncio.Event(),
+        "_started": False,
+        "_url": url,
+        "_directory": directory,
+        "_target": target,
+        "_token": token,
     }
     _downloads[task_id]["_pause_event"].set()
-    _tasks[task_id] = asyncio.create_task(
-        _run_download(task_id, url, directory, target, token)
-    )
+    _schedule_downloads()
     return public_status(task_id)
 
 
@@ -318,17 +450,25 @@ def toggle_pause(task_id):
     if status is None:
         raise ValueError("下载任务不存在")
 
-    if status["status"] == "running":
+    if status["status"] == "queued":
+        status["status"] = "paused"
+        status["speed"] = 0
+    elif status["status"] == "running":
+        status["_started"] = status.get("_started", True)
         status["_pause_event"].clear()
         status["status"] = "paused"
         status["speed"] = 0
     elif status["status"] == "paused":
-        now = time.monotonic()
-        status["_last_progress_at"] = now
-        status["_speed_window_started"] = now
-        status["_speed_window_bytes"] = 0
-        status["_pause_event"].set()
-        status["status"] = "running"
+        if status.get("_started"):
+            now = time.monotonic()
+            status["_last_progress_at"] = now
+            status["_speed_window_started"] = now
+            status["_speed_window_bytes"] = 0
+            status["_pause_event"].set()
+            status["status"] = "running"
+        else:
+            status["status"] = "queued"
+            _schedule_downloads()
     else:
         raise ValueError("当前下载任务不能暂停或继续")
     return public_status(task_id)
@@ -349,4 +489,21 @@ async def cancel_download(task_id):
             await task
         except asyncio.CancelledError:
             pass
+    else:
+        target = status.get("_target")
+        if target is not None:
+            Path(target).with_name(
+                f".{Path(target).name}.toolbag.part"
+            ).unlink(missing_ok=True)
+        status.update(
+            {
+                "status": "canceled",
+                "downloaded": 0,
+                "total": 0,
+                "speed": 0,
+                "stalled": False,
+                "error": None,
+            }
+        )
+        _schedule_downloads()
     return public_status(task_id)
