@@ -35,6 +35,7 @@ async def start_modelscope_download(request):
             data.get("directory", ""),
             data.get("name", ""),
             data.get("token"),
+            data.get("fallback_url"),
         )
         return web.json_response(result)
     except (TypeError, ValueError) as error:

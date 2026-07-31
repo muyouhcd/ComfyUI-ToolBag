@@ -24,6 +24,19 @@ class ModelScopeDownloadTest(unittest.TestCase):
                 "https://huggingface.co/Comfy-Org/test/resolve/main/model.safetensors"
             )
 
+        fallback = (
+            "https://huggingface.co/Comfy-Org/test/"
+            "resolve/main/model.safetensors"
+        )
+        self.assertEqual(
+            modelscope_download.validate_huggingface_url(fallback),
+            fallback,
+        )
+        with self.assertRaises(ValueError):
+            modelscope_download.validate_huggingface_url(
+                "https://example.com/model.safetensors"
+            )
+
     def test_resolve_target_path_rejects_traversal(self):
         from tempfile import TemporaryDirectory
 
@@ -305,10 +318,15 @@ class ModelScopeDownloadTest(unittest.TestCase):
                 }
                 await modelscope_download._run_download(
                     task_id,
-                    f"http://127.0.0.1:{port}/model.safetensors",
+                    [
+                        {
+                            "provider": "ModelScope",
+                            "url": f"http://127.0.0.1:{port}/model.safetensors",
+                            "token": None,
+                        }
+                    ],
                     "checkpoints",
                     target,
-                    None,
                 )
                 self.assertEqual(
                     modelscope_download._downloads[task_id]["status"],
@@ -320,6 +338,144 @@ class ModelScopeDownloadTest(unittest.TestCase):
             modelscope_download.MIN_PART_SIZE = old_part_size
             modelscope_download._downloads.pop(task_id, None)
             await runner.cleanup()
+
+    def test_falls_back_after_primary_404(self):
+        asyncio.run(self._run_fallback_download_test())
+
+    async def _run_fallback_download_test(self):
+        payload = bytes(range(128)) * 4096
+        fallback_authorization = []
+
+        async def missing_file(_request):
+            return web.Response(status=404)
+
+        async def serve_file(request):
+            fallback_authorization.append(request.headers.get("Authorization"))
+            range_header = request.headers.get("Range")
+            if not range_header:
+                return web.Response(
+                    body=payload,
+                    content_type="application/octet-stream",
+                )
+
+            start_text, end_text = range_header.removeprefix("bytes=").split("-")
+            start = int(start_text)
+            end = int(end_text)
+            return web.Response(
+                status=206,
+                body=payload[start:end + 1],
+                headers={"Content-Range": f"bytes {start}-{end}/{len(payload)}"},
+                content_type="application/octet-stream",
+            )
+
+        app = web.Application()
+        app.router.add_get("/missing.safetensors", missing_file)
+        app.router.add_get("/model.safetensors", serve_file)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        from tempfile import TemporaryDirectory
+
+        task_id = "fallback-test"
+        old_part_size = modelscope_download.MIN_PART_SIZE
+        try:
+            with TemporaryDirectory() as temp_dir:
+                target = Path(temp_dir, "model.safetensors")
+                modelscope_download.MIN_PART_SIZE = 64 * 1024
+                pause_event = asyncio.Event()
+                pause_event.set()
+                modelscope_download._downloads[task_id] = {
+                    "task_id": task_id,
+                    "status": "running",
+                    "name": target.name,
+                    "path": str(target),
+                    "downloaded": 0,
+                    "total": 0,
+                    "speed": 0,
+                    "stalled": False,
+                    "error": None,
+                    "provider": "ModelScope",
+                    "fallback_used": False,
+                    "fallback_reason": None,
+                    "created_at": time.time(),
+                    "_last_progress_at": time.monotonic(),
+                    "_speed_window_started": time.monotonic(),
+                    "_speed_window_bytes": 0,
+                    "_pause_event": pause_event,
+                }
+                await modelscope_download._run_download(
+                    task_id,
+                    [
+                        {
+                            "provider": "ModelScope",
+                            "url": f"http://127.0.0.1:{port}/missing.safetensors",
+                            "token": "modelscope-only",
+                        },
+                        {
+                            "provider": "Hugging Face",
+                            "url": f"http://127.0.0.1:{port}/model.safetensors",
+                            "token": None,
+                        },
+                    ],
+                    "checkpoints",
+                    target,
+                )
+                status = modelscope_download._downloads[task_id]
+                self.assertEqual(status["status"], "complete", status["error"])
+                self.assertEqual(status["provider"], "Hugging Face")
+                self.assertTrue(status["fallback_used"])
+                self.assertIn("ModelScope", status["fallback_reason"])
+                self.assertTrue(fallback_authorization)
+                self.assertEqual(set(fallback_authorization), {None})
+                self.assertEqual(target.read_bytes(), payload)
+        finally:
+            modelscope_download.MIN_PART_SIZE = old_part_size
+            modelscope_download._downloads.pop(task_id, None)
+            await runner.cleanup()
+
+    def test_list_downloads_keeps_latest_status_per_path(self):
+        now = time.time()
+        modelscope_download._downloads.update(
+            {
+                "old-error": {
+                    "task_id": "old-error",
+                    "status": "error",
+                    "name": "same.safetensors",
+                    "path": "/models/same.safetensors",
+                    "downloaded": 0,
+                    "total": 0,
+                    "speed": 0,
+                    "error": "temporary failure",
+                    "created_at": now,
+                },
+                "new-complete": {
+                    "task_id": "new-complete",
+                    "status": "complete",
+                    "name": "same.safetensors",
+                    "path": "/models/same.safetensors",
+                    "downloaded": 1,
+                    "total": 1,
+                    "speed": 0,
+                    "error": None,
+                    "created_at": now + 1,
+                },
+            }
+        )
+        try:
+            downloads = modelscope_download.list_downloads()
+            matching = [
+                item
+                for item in downloads
+                if item["path"] == "/models/same.safetensors"
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0]["status"], "complete")
+        finally:
+            modelscope_download._downloads.pop("old-error", None)
+            modelscope_download._downloads.pop("new-complete", None)
 
 
 if __name__ == "__main__":

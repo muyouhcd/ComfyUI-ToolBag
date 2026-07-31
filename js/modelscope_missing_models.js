@@ -39,12 +39,18 @@ function renderDownloadState(button, state) {
         const percent = state.total
             ? (state.downloaded / state.total * 100).toFixed(1)
             : "0.0";
+        const provider = state.fallback_used
+            ? "Hugging Face 回退"
+            : (state.provider ?? "ModelScope");
         button.textContent = state.stalled
-            ? `${percent}% · 正在重连…`
-            : `${percent}% · ${formatBytes(state.downloaded)} · ${formatBytes(state.speed)}/s`;
+            ? `${provider} · ${percent}% · 正在重连…`
+            : `${provider} · ${percent}% · ${formatBytes(state.downloaded)} · ${formatBytes(state.speed)}/s`;
         button.title = state.stalled
             ? "连接超过 5 秒没有收到数据，下载器将自动重连"
-            : `已下载 ${formatBytes(state.downloaded)} / ${formatBytes(state.total)}；点击暂停`;
+            : `${provider}：已下载 ${formatBytes(state.downloaded)} / ${formatBytes(state.total)}；点击暂停`;
+        if (state.fallback_reason) {
+            button.title += `\n自动回退原因：${state.fallback_reason}`;
+        }
         button.disabled = false;
         return;
     }
@@ -55,7 +61,9 @@ function renderDownloadState(button, state) {
         return;
     }
     if (state.status === "complete") {
-        button.textContent = "已安装";
+        button.textContent = state.fallback_used
+            ? "已安装 · Hugging Face 回退"
+            : "已安装";
         button.disabled = true;
         return;
     }
@@ -207,6 +215,7 @@ async function startFastDownload(
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 url,
+                fallback_url: model.fallback_url,
                 name: modelName,
                 directory: model.directory,
                 token,
