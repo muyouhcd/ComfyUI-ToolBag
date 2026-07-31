@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     getModelScopeLink,
     rewriteWorkflowModelUrls,
+    toHuggingFaceUrl,
     toModelScopeUrl,
 } from "../js/modelscope_url.mjs";
 
@@ -14,6 +15,22 @@ test("converts Hugging Face file URLs to ModelScope", () => {
             "ae.safetensors",
         ),
         "https://www.modelscope.cn/models/Comfy-Org/z_image_turbo/resolve/master/split_files/vae/ae.safetensors",
+    );
+});
+
+test("builds a Hugging Face fallback from either provider", () => {
+    const expected = "https://huggingface.co/VAST-AI/TripoSplat/resolve/main/vae/model.safetensors";
+    assert.equal(
+        toHuggingFaceUrl(
+            "https://www.modelscope.cn/models/VAST-AI/TripoSplat/resolve/master/vae/model.safetensors",
+        ),
+        expected,
+    );
+    assert.equal(
+        toHuggingFaceUrl(
+            "https://huggingface.co/VAST-AI/TripoSplat/blob/main/vae/model.safetensors?download=true",
+        ),
+        expected,
     );
 });
 
@@ -66,6 +83,7 @@ test("rewrites workflow and node model metadata", () => {
     assert.deepEqual(models.get("root.safetensors"), {
         name: "root.safetensors",
         url: workflow.models[0].url,
+        fallback_url: "https://huggingface.co/Comfy-Org/root/resolve/main/root.safetensors",
         directory: undefined,
     });
 });

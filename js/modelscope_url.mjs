@@ -46,6 +46,31 @@ export function toModelScopeUrl(sourceUrl, modelName) {
     return `${MODELSCOPE_ORIGIN}/models/${resolved.owner}/${resolved.repository}/resolve/${revision}/${resolved.filePath}`;
 }
 
+export function toHuggingFaceUrl(sourceUrl) {
+    if (!sourceUrl) return null;
+
+    let url;
+    try {
+        url = new URL(sourceUrl);
+    } catch {
+        return null;
+    }
+
+    const hostname = url.hostname.toLowerCase().replace(/^www\./, "");
+    if (!["huggingface.co", "modelscope.cn"].includes(hostname)) return null;
+
+    const resolved = splitRepositoryPath(
+        url.pathname,
+        hostname === "huggingface.co"
+            ? (url.pathname.includes("/resolve/") ? "resolve" : "blob")
+            : "resolve",
+    );
+    if (!resolved?.filePath) return null;
+
+    const revision = resolved.revision === "master" ? "main" : resolved.revision;
+    return `https://huggingface.co/${resolved.owner}/${resolved.repository}/resolve/${revision}/${resolved.filePath}`;
+}
+
 export function rewriteWorkflowModelUrls(
     workflow,
     linksByName = new Map(),
@@ -60,11 +85,15 @@ export function rewriteWorkflowModelUrls(
         if (Array.isArray(value.models)) {
             for (const model of value.models) {
                 if (!model || typeof model !== "object" || typeof model.name !== "string") continue;
+                const fallbackUrl = toHuggingFaceUrl(
+                    model.fallback_url ?? model.original_url ?? model.url,
+                );
                 model.url = toModelScopeUrl(model.url, model.name);
                 linksByName.set(model.name, model.url);
                 modelsByName.set(model.name, {
                     name: model.name,
                     url: model.url,
+                    fallback_url: fallbackUrl,
                     directory: model.directory,
                 });
             }

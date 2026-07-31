@@ -34,6 +34,7 @@ from .image_alpha_fill import (
 )
 from . import modelscope_routes
 from . import model_usage_routes
+from . import system_metrics_routes
 
 NODE_CLASS_MAPPINGS = {
     **COMPOSITE_MAPPINGS,
